@@ -12,23 +12,50 @@ tapi ditulis ulang dengan skema lebih ramping dan 3 bug yang ditemukan di SCIA s
    nilai yang sistemnya sendiri hasilkan (circular), sehingga "belajar" dari dirinya sendiri. Di sini, skor
    (`wallet_scores`) dihitung ulang dari `price_snapshots` yang diambil dari sumber harga eksternal.
 
+## Pipeline (3 Tahap + Helius)
+
+```
+extract_onchain.py          stage2_fetch_prices.py      stage3_compute_scores.py
+(Helius RPC → SQLite)  →   (GeckoTerminal → harga)  →   (hitung skor wallet)
+       ↓                            ↓                           ↓
+  stage1_onchain.db         stage2_prices.db            stage3_scores.db
+```
+
+### 🆕 extract_onchain.py — Helius On-Chain Extractor
+
+**Mode single token (✅ proven working):**
+```bash
+export HELIUS_API_KEY="your-key-here"
+python3 scripts/extract_onchain.py --token-mint <MINT_ADDRESS> --out stage1_onchain.db
+```
+
+**Mode batch dari file:**
+```bash
+python3 scripts/extract_onchain.py --token-list tokens.txt --max-buyers 30 --out stage1_onchain.db
+```
+
+**Mode discover (experimental):**
+```bash
+python3 scripts/extract_onchain.py --discover --max-tokens 10 --out stage1_onchain.db
+```
+
 ## Status saat ini (jujur, per commit ini)
 
 **Sudah ada dan sudah ditest:**
 - `supabase/migrations/0001_init.sql` — skema database inti (5 tabel)
 - `lib/scoring.ts` — fungsi murni penghitung skor early-buyer + deteksi wallet bot-suspect
 - `lib/scoring.test.ts` — 9 kasus uji, termasuk kasus tepi (harga null, sample kurang, entry price 0, floating point)
+- `scripts/extract_onchain.py` — 🆕 Helius on-chain extractor: ambil data transaksi langsung dari Solana, temukan early buyers, output SQLite identik stage1
 
 **BELUM ada:**
-- Tidak ada kode yang mengambil data on-chain (belum terhubung ke Helius atau sumber manapun)
-- Tidak ada kode yang mengambil harga dari GeckoTerminal/DexScreener
+- Tidak ada kode yang mengambil harga dari GeckoTerminal/DexScreener (stage2 sudah ada script-nya, belum jalan penuh)
 - Tidak ada dashboard (halaman Next.js)
 - Tidak ada koneksi ke Supabase yang sesungguhnya — migrasi belum pernah dijalankan ke instance manapun
 - Tidak ada bot Telegram/notifikasi
 - Tidak ada cron job
 - Skema dan fungsi skor belum pernah diuji dengan data SCIA yang sesungguhnya (backup 1.4 GB), baru data tiruan.
 
-Singkatnya: ini adalah fondasi (skema + logika skor yang teruji), bukan aplikasi yang bisa dipakai.
+Singkatnya: ini adalah fondasi (skema + logika skor yang teruji + Helius extractor), bukan aplikasi yang bisa dipakai.
 Jangan anggap ini "siap pakai" — langkah berikutnya adalah menyambungkan fondasi ini ke data nyata.
 
 ## Menjalankan test
