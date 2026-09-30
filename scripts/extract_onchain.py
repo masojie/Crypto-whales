@@ -10,7 +10,7 @@ MODE:
   2. --token-list <file.txt>  -> lacak banyak token (1 mint per baris)
   3. --discover               -> cari token baru (best-effort, eksperimental)
 
-Perubahan dari v3:
+Perubahan dari v3 (v4.1 menambah harga entry per transaksi + deteksi bundle):
   - Transaksi dibaca dari yang PALING AWAL (getTransactionsForAddress, sortOrder=asc).
     v3 memakai getSignaturesForAddress yang mengembalikan transaksi TERBARU dulu,
     jadi untuk token berumur jam-an hasilnya pembeli terkini, bukan early buyer.
@@ -21,6 +21,9 @@ Perubahan dari v3:
   - coins.first_seen_at = waktu on-chain transaksi pertama token, bukan waktu skrip jalan.
   - Cek HELIUS_API_KEY dipindah ke main(), jadi modul bisa di-import/di-test.
   - Error parsing tidak lagi ditelan diam-diam.
+  - Pembeli diambil dari SEMUA penerima token (satu tx bisa memuat banyak pembeli/bundle),
+    lengkap dengan harga entry (SOL/token) dari transaksinya sendiri dan volume SOL nyata.
+  - Wallet bundle ditandai is_bot_suspect (insider), bukan dinilai sebagai whale.
 
 Kunci API dibaca dari env HELIUS_API_KEY, tidak pernah ditulis ke file.
 Hanya butuh Python standar (urllib), cocok untuk Termux.
@@ -167,40 +170,98 @@ def parse_txs(sigs):
     return out
 
 
+def trade_pairs(tx, mint):
+    """Semua perpindahan token koin yang punya pasangan SOL di transaksi yang sama.
+    Harga = SOL yang dibayar pihak penerima ke pihak pengirim / jumlah token.
+    SOL dihitung dari nativeTransfers DAN transfer wSOL. Biaya/tip ke akun lain tidak ikut.
+    Cocok untuk bonding curve pump.fun maupun AMM (pumpswap, dll)."""
+    nat = tx.get("nativeTransfers") or []
+    tts = tx.get("tokenTransfers") or []
+    agg = {}
+    for t in tts:
+        if t.get("mint") != mint:
+            continue
+        a, b = t.get("fromUserAccount"), t.get("toUserAccount")
+        amt = float(t.get("tokenAmount") or 0)
+        if not a or not b or a == b or amt <= 0:
+            continue
+        agg.setdefault((a, b), {"sender": a, "receiver": b, "tokens": 0.0})["tokens"] += amt
+    out = []
+    for (a, b), e in agg.items():
+        sol = sum(int(n.get("amount", 0)) for n in nat
+                  if n.get("fromUserAccount") == b and n.get("toUserAccount") == a) / 1e9
+        sol += sum(float(w.get("tokenAmount") or 0) for w in tts
+                   if w.get("mint") == SOL_MINT and w.get("fromUserAccount") == b and w.get("toUserAccount") == a)
+        if sol > 0:
+            e["sol"], e["price"] = sol, sol / e["tokens"]
+            out.append(e)
+    return out
+
+
 def _parse_buys(tx, mint):
-    """Pembeli = fee payer yang MENERIMA token koin. Volume SOL hanya diisi bila
-    Helius memberi swap.nativeInput; selain itu None (tidak ditebak)."""
-    payer, ts = tx.get("feePayer"), tx.get("timestamp")
-    if not payer or not ts:
+    """Pembeli di satu transaksi. Satu transaksi bisa memuat BANYAK pembeli (bundle):
+    penerima token dianggap pembeli bila dia fee payer, atau bila pengirimnya melayani
+    >=2 penerima (pola bundle). Hanya perpindahan yang punya pasangan SOL yang dihitung,
+    jadi airdrop/dust tanpa pembayaran tidak dianggap pembelian."""
+    pairs, payer, ts = trade_pairs(tx, mint), tx.get("feePayer"), tx.get("timestamp")
+    if not pairs or not payer or not ts:
         return []
-    got = sum(float(t.get("tokenAmount") or 0) for t in tx.get("tokenTransfers", [])
-              if t.get("mint") == mint and t.get("toUserAccount") == payer)
-    if got <= 0:
-        return []
-    vol = None
-    ni = ((tx.get("events") or {}).get("swap") or {}).get("nativeInput")
-    if ni and ni.get("account") == payer and ni.get("amount"):
-        vol = round(int(ni["amount"]) / 1e9, 4)
-    return [{"buyer": payer, "ts": ts, "sol_volume": vol}]
+    fanout = {}
+    for p in pairs:
+        fanout.setdefault(p["sender"], set()).add(p["receiver"])
+    buys = {}
+    for p in pairs:
+        if p["receiver"] == payer or (p["sender"] != payer and len(fanout[p["sender"]]) >= 2):
+            b = buys.setdefault(p["receiver"], {"tokens": 0.0, "sol": 0.0})
+            b["tokens"] += p["tokens"]
+            b["sol"] += p["sol"]
+    return [{"buyer": w, "ts": ts, "sol_volume": round(v["sol"], 4), "price_sol": v["sol"] / v["tokens"],
+             "bundle_size": len(buys)} for w, v in buys.items()]
 
 
-def find_buyers(mint, max_n=30, page_size=300, max_pages=3):
-    """Return (buyers_terurut_awal, jumlah_beli_per_wallet, ts_transaksi_pertama)."""
+def find_buyers(mint, max_n=30, page_size=300, max_pages=3, early_window=3600):
+    """Return (buyers_terurut_awal, jumlah_beli_per_wallet, ts_transaksi_pertama).
+    Hanya pembelian dalam `early_window` detik sejak transaksi pertama token yang dihitung
+    (default 1 jam), supaya pembeli yang datang berhari-hari kemudian tidak disebut early."""
     buyers, counts, first_ts = {}, {}, None
+    stop = False
     for page in earliest_pages(mint, page_size, max_pages):
         if first_ts is None and page:
             first_ts = page[0].get("blockTime")
         for tx in parse_txs([x["signature"] for x in page]):
             for b in _parse_buys(tx, mint):
+                if first_ts is not None and b["ts"] > first_ts + early_window:
+                    stop = True
+                    continue
                 w = b["buyer"]
                 counts[w] = counts.get(w, 0) + 1
                 if w not in buyers:
                     buyers[w] = {"wallet": w, "first_seen": iso(b["ts"]), "first_seen_epoch": b["ts"],
-                                 "sol_volume": b["sol_volume"]}
-        if len(buyers) >= max_n:
+                                 "sol_volume": b["sol_volume"], "price_sol": b["price_sol"],
+                                 "bundle_size": b["bundle_size"]}
+        if len(buyers) >= max_n or stop or (first_ts is not None and page and page[-1].get("blockTime", 0) > first_ts + early_window):
             break
     early = sorted(buyers.values(), key=lambda x: x["first_seen_epoch"])[:max_n]
     return early, counts, first_ts
+
+
+def window_price(mint, start_ts, span=600, limit=40):
+    """Harga pasar (SOL/token) = median harga trade pada jendela [start_ts, start_ts+span].
+    Dibaca dari transaksi koin itu sendiri (bonding curve maupun AMM), sehingga tidak
+    bergantung pada candle jam GeckoTerminal. Jendela dilebarkan 6x bila kosong.
+    Return (harga, jumlah_sampel) atau (None, 0). Trade < 0,005 SOL diabaikan (dust)."""
+    for sp in (span, 6 * span):
+        res = rpc("getTransactionsForAddress",
+                  [mint, {"transactionDetails": "signatures", "sortOrder": "asc", "limit": limit,
+                          "filters": {"blockTime": {"gte": int(start_ts), "lte": int(start_ts) + sp}}}], quiet=False)
+        data = [x for x in (res.get("data") or []) if not x.get("err")] if isinstance(res, dict) else []
+        if not data:
+            continue
+        prices = sorted(p["price"] for t in parse_txs([x["signature"] for x in data])
+                        for p in trade_pairs(t, mint) if p["sol"] >= 0.005)
+        if prices:
+            return prices[len(prices) // 2], len(prices)
+    return None, 0
 
 
 # -- Database ---------------------------------------------------------------
@@ -211,6 +272,7 @@ def init_db(path):
         CREATE TABLE IF NOT EXISTS coins(mint TEXT PRIMARY KEY, symbol TEXT, first_seen_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS appearances(wallet TEXT NOT NULL, coin_mint TEXT NOT NULL, first_seen_at TEXT NOT NULL, native_sol_volume REAL, PRIMARY KEY(wallet, coin_mint));
         CREATE TABLE IF NOT EXISTS appearance_counts(wallet TEXT NOT NULL, coin_mint TEXT NOT NULL, n_buys INTEGER NOT NULL, PRIMARY KEY(wallet, coin_mint));
+        CREATE TABLE IF NOT EXISTS appearance_entry(wallet TEXT NOT NULL, coin_mint TEXT NOT NULL, entry_ts INTEGER NOT NULL, entry_price_sol REAL, bundle_size INTEGER NOT NULL, secs_after_creation INTEGER, PRIMARY KEY(wallet, coin_mint));
     """)
     return db
 
@@ -227,6 +289,10 @@ def save(db, token, buyers, counts):
         else:
             db.execute("INSERT INTO appearances(wallet,coin_mint,first_seen_at,native_sol_volume) VALUES(?,?,?,?)", (w, m, fs, sv))
         db.execute("INSERT OR REPLACE INTO appearance_counts(wallet,coin_mint,n_buys) VALUES(?,?,?)", (w, m, counts.get(w, 1)))
+        created = token.get("created_epoch")
+        db.execute("INSERT OR REPLACE INTO appearance_entry VALUES(?,?,?,?,?,?)",
+                   (w, m, b["first_seen_epoch"], b.get("price_sol"), b.get("bundle_size", 1),
+                    (b["first_seen_epoch"] - created) if created is not None else None))
     db.commit()
 
 
@@ -242,6 +308,11 @@ def recompute_wallets(db):
         if c <= LO and t >= HI:
             db.execute("UPDATE wallets SET is_bot_suspect=1,bot_suspect_reason=? WHERE address=?",
                        (f"Muncul {t}x di {c} koin — bot/sniper", a))
+    # Wallet yang membeli di transaksi yang sama dengan wallet lain (bundle) = kelompok insider/sniper,
+    # bukan whale independen. Ditandai supaya stage3 tidak memberi skor "alpha".
+    db.execute("""UPDATE wallets SET is_bot_suspect=1,
+                  bot_suspect_reason='bundle/insider: beli satu transaksi dengan wallet lain saat peluncuran'
+                  WHERE is_bot_suspect=0 AND address IN (SELECT wallet FROM appearance_entry WHERE bundle_size>=2)""")
     db.commit()
 
 
@@ -270,6 +341,7 @@ def main():
     p.add_argument("--max-buyers", type=int, default=30)
     p.add_argument("--scan-sigs", type=int, default=300, help="transaksi tertua per halaman (maks 1000)")
     p.add_argument("--max-pages", type=int, default=3, help="maks halaman per token")
+    p.add_argument("--early-window", type=int, default=3600, help="detik sejak tx pertama token yang masih dianggap early")
     p.add_argument("--out", default="stage1_onchain.db")
     a = p.parse_args()
     helius_key()  # gagal cepat kalau key kosong
@@ -295,9 +367,9 @@ def main():
     print(f"\n🔍 Melacak early buyers untuk {len(tokens)} token...\n")
     for i, token in enumerate(tokens):
         print(f"[{i + 1}/{len(tokens)}] {token['mint'][:16]}...", end=" ", flush=True)
-        buyers, counts, first_ts = find_buyers(token["mint"], a.max_buyers, min(a.scan_sigs, 1000), a.max_pages)
+        buyers, counts, first_ts = find_buyers(token["mint"], a.max_buyers, min(a.scan_sigs, 1000), a.max_pages, a.early_window)
         if first_ts:
-            token["created_at"] = iso(first_ts)
+            token["created_at"], token["created_epoch"] = iso(first_ts), first_ts
         elif buyers:
             token["created_at"] = buyers[0]["first_seen"]
         if not buyers:
