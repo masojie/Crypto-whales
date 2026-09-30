@@ -15,7 +15,9 @@ Cara kerja:
   - entry  = harga fill transaksi beli wallet itu sendiri (SOL/token), dari extract_onchain.py
   - h1/h4/h24 = median harga trade koin pada jendela waktu setelah entry wallet
                 (dibaca dari transaksi koin di chain via Helius, curve maupun AMM)
-  - Harga yang belum bisa diketahui (horizon belum lewat / tidak ada trade) = NULL, tidak ditebak.
+  - Bila tidak ada trade di jendela, dipakai harga trade TERAKHIR sebelum horizon (koin mati dinilai
+    dengan harga terakhirnya, bukan dibuang). Matikan dengan --no-carry.
+  - Horizon yang belum lewat, atau koin yang tidak punya trade sama sekali = NULL, tidak ditebak.
 
 SATUAN: kolom price_usd berisi harga dalam SOL per token (tabel meta mencatatnya).
 Stage3 hanya memakai rasio entry vs h4, jadi selama satuannya konsisten hasilnya valid.
@@ -36,6 +38,7 @@ def main():
     p.add_argument("--stage1-db", required=True, help="DB keluaran extract_onchain.py")
     p.add_argument("--out", default="stage2_onchain.db")
     p.add_argument("--max-coins", type=int, default=0, help="0 = semua")
+    p.add_argument("--no-carry", action="store_true", help="jangan pakai harga trade terakhir untuk koin tanpa trade di jendela (hasil bias ke koin hidup)")
     a = p.parse_args()
     x.helius_key()
 
@@ -61,6 +64,7 @@ def main():
         rows = s1.execute("SELECT wallet, entry_ts, entry_price_sol FROM appearance_entry WHERE coin_mint=?", (mint,)).fetchall()
         cache, stamp = {}, datetime.now(timezone.utc).isoformat()
         got = {"h1": 0, "h4": 0, "h24": 0}
+        carried = 0
         for wallet, ets, eprice in rows:
             pts = {"entry": eprice}
             for h, sec in HORIZONS.items():
@@ -70,14 +74,16 @@ def main():
                     continue
                 key = (h, target // 60)     # wallet yang masuk dalam menit yang sama berbagi jendela
                 if key not in cache:
-                    cache[key] = x.window_price(mint, (target // 60) * 60)[0]
-                pts[h] = cache[key]
+                    pr, _, kind = x.window_price(mint, (target // 60) * 60, carry=not a.no_carry)
+                    cache[key] = (pr, kind)
+                pts[h], kind = cache[key]
                 got[h] += pts[h] is not None
+                carried += kind == "carry"
             for h, v in pts.items():
                 out.execute("INSERT OR REPLACE INTO price_points VALUES(?,?,?,?,?)", (wallet, mint, h, v, stamp))
         out.execute("INSERT OR REPLACE INTO coins_done VALUES(?,?)", (mint, stamp))
         out.commit()
-        print(f"[{i}/{len(coins)}] {mint[:12]}.. {len(rows)} wallet | harga ditemukan h1={got['h1']} h4={got['h4']} h24={got['h24']} | panggilan Helius {x._calls['rpc']}+{x._calls['parse']}")
+        print(f"[{i}/{len(coins)}] {mint[:12]}.. {len(rows)} wallet | harga ditemukan h1={got['h1']} h4={got['h4']} h24={got['h24']} (carry {carried}) | panggilan Helius {x._calls['rpc']}+{x._calls['parse']}")
     print(f"\nSelesai. Satuan harga: SOL per token. Keluaran: {a.out}")
     return 0
 

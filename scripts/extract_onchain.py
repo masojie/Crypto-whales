@@ -245,23 +245,41 @@ def find_buyers(mint, max_n=30, page_size=300, max_pages=3, early_window=3600):
     return early, counts, first_ts
 
 
-def window_price(mint, start_ts, span=600, limit=40):
-    """Harga pasar (SOL/token) = median harga trade pada jendela [start_ts, start_ts+span].
-    Dibaca dari transaksi koin itu sendiri (bonding curve maupun AMM), sehingga tidak
-    bergantung pada candle jam GeckoTerminal. Jendela dilebarkan 6x bila kosong.
-    Return (harga, jumlah_sampel) atau (None, 0). Trade < 0,005 SOL diabaikan (dust)."""
+def _signatures(mint, order, limit, block_time_filter):
+    res = rpc("getTransactionsForAddress",
+              [mint, {"transactionDetails": "signatures", "sortOrder": order, "limit": limit,
+                      "filters": {"blockTime": block_time_filter}}], quiet=False)
+    data = res.get("data") if isinstance(res, dict) else None
+    return [x_["signature"] for x_ in (data or []) if not x_.get("err")]
+
+
+def _median_price(txs, mint, min_sol=0.005):
+    prices = sorted(p["price"] for t in txs for p in trade_pairs(t, mint) if p["sol"] >= min_sol)
+    return (prices[len(prices) // 2], len(prices)) if prices else (None, 0)
+
+
+def window_price(mint, start_ts, span=600, limit=40, carry=True):
+    """Harga pasar (SOL/token) di sekitar start_ts, dibaca dari transaksi koin itu sendiri
+    (bonding curve maupun AMM), tanpa candle GeckoTerminal.
+      1. median harga trade >= 0,005 SOL pada [start_ts, start_ts+span], lalu jendela 6x lebih lebar;
+      2. bila tetap kosong dan carry=True: harga trade TERAKHIR sebelum start_ts (last-traded price).
+         Ini penting: koin yang mati (tak ada trade lagi) tetap dinilai dengan harga terakhirnya,
+         bukan dibuang. Membuang koin mati = survivorship bias.
+    Return (harga, jumlah_sampel, jenis) dengan jenis 'window' | 'carry' | None."""
     for sp in (span, 6 * span):
-        res = rpc("getTransactionsForAddress",
-                  [mint, {"transactionDetails": "signatures", "sortOrder": "asc", "limit": limit,
-                          "filters": {"blockTime": {"gte": int(start_ts), "lte": int(start_ts) + sp}}}], quiet=False)
-        data = [x for x in (res.get("data") or []) if not x.get("err")] if isinstance(res, dict) else []
-        if not data:
-            continue
-        prices = sorted(p["price"] for t in parse_txs([x["signature"] for x in data])
-                        for p in trade_pairs(t, mint) if p["sol"] >= 0.005)
-        if prices:
-            return prices[len(prices) // 2], len(prices)
-    return None, 0
+        sigs = _signatures(mint, "asc", limit, {"gte": int(start_ts), "lte": int(start_ts) + sp})
+        if sigs:
+            price, n = _median_price(parse_txs(sigs), mint)
+            if price is not None:
+                return price, n, "window"
+    if carry:
+        sigs = _signatures(mint, "desc", limit, {"lte": int(start_ts)})
+        if sigs:
+            for t in sorted(parse_txs(sigs), key=lambda t: -t.get("timestamp", 0)):
+                price, n = _median_price([t], mint)
+                if price is not None:
+                    return price, n, "carry"
+    return None, 0, None
 
 
 # -- Database ---------------------------------------------------------------
