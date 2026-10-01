@@ -66,6 +66,8 @@ def main():
     ap.add_argument("--max-age-hours", type=float, default=30)
     ap.add_argument("--window-sec", type=int, default=60)
     ap.add_argument("--max-windows", type=int, default=12)
+    ap.add_argument("--workers", type=int, default=4, help="jendela waktu yang dibaca paralel")
+    ap.add_argument("--oversample", type=float, default=2.0, help="kumpulkan count x oversample sebelum sampel acak diambil")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--out", default="mints.txt")
     a = ap.parse_args()
@@ -73,16 +75,26 @@ def main():
     rng = random.Random(a.seed)
     now = int(time.time())
     lo, hi = now - int(a.max_age_hours * 3600), now - int(a.min_age_hours * 3600) - a.window_sec
+    from concurrent.futures import ThreadPoolExecutor
     found, seen, windows = [], set(), 0
-    while len(found) < a.count * 2 and windows < a.max_windows:
-        start = rng.randint(lo, hi)
-        windows += 1
-        toks, nsig = creates_in_window(start, a.window_sec)
-        new = [t for t in toks if t["mint"] not in seen]
-        for t in new:
-            seen.add(t["mint"])
-        found.extend(new)
-        print(f"jendela {windows}: {datetime.fromtimestamp(start, timezone.utc):%d %b %H:%M:%S}Z  {nsig} tx -> {len(new)} token CREATE baru")
+
+    def safe(start):
+        try:
+            return creates_in_window(start, a.window_sec)
+        except Exception as e:
+            print(f"  jendela gagal: {type(e).__name__}", file=sys.stderr)
+            return [], 0
+
+    with ThreadPoolExecutor(max_workers=max(1, a.workers)) as ex:
+        while len(found) < a.count * a.oversample and windows < a.max_windows:
+            starts = [rng.randint(lo, hi) for _ in range(min(a.workers * 2, a.max_windows - windows))]
+            for start, (toks, nsig) in zip(starts, ex.map(safe, starts)):
+                windows += 1
+                new = [t for t in toks if t["mint"] not in seen]
+                for t in new:
+                    seen.add(t["mint"])
+                found.extend(new)
+            print(f"{windows} jendela -> {len(found)} token CREATE unik", flush=True)
     if not found:
         print("Tidak ada token ditemukan.", file=sys.stderr)
         return 1
