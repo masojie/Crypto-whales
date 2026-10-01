@@ -63,4 +63,12 @@ check("wallet wajar tidak ditandai", r["HUMAN"][2] == 0)
 check("wallet bundle ditandai insider", r["INSIDER"][2] == 1)
 e = db.execute("select entry_price_sol, secs_after_creation from appearance_entry where wallet='HUMAN'").fetchone()
 check("harga entry per wallet tersimpan (0.002) + detik sejak dibuat (2)", e == (0.002, 2))
+# --- collect_new_tokens: ekstraksi mint dari transaksi CREATE
+import collect_new_tokens as c
+check("CREATE dengan dev-buy: mint dari tokenTransfers",
+      c.mint_of_create({"type": "CREATE", "source": "PUMP_FUN", "tokenTransfers": [{"mint": "MINTX"}]}) == "MINTX")
+check("CREATE tanpa tokenTransfers: mint dari akun pertama instruksi pump.fun",
+      c.mint_of_create({"type": "CREATE", "source": "PUMP_FUN", "tokenTransfers": [], "instructions": [{"programId": "Compute"}, {"programId": c.PUMP_FUN, "accounts": ["MINTY", "B"]}]}) == "MINTY")
+check("swap/non-CREATE diabaikan", c.mint_of_create({"type": "SWAP", "source": "PUMP_FUN", "tokenTransfers": [{"mint": "M"}]}) is None)
+
 print(f"\nSEMUA TEST LOLOS ({ok})")

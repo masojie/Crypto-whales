@@ -29,7 +29,7 @@ Kunci API dibaca dari env HELIUS_API_KEY, tidak pernah ditulis ke file.
 Hanya butuh Python standar (urllib), cocok untuk Termux.
 Catatan: User-Agent khusus wajib; UA bawaan urllib ditolak (HTTP 403) oleh api.helius.xyz.
 """
-import argparse, json, os, sqlite3, sys, time, urllib.request, urllib.error
+import argparse, json, os, random, sqlite3, sys, threading, time, urllib.request, urllib.error
 from datetime import datetime, timezone
 
 PUMP_FUN = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -51,22 +51,28 @@ def iso(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _post(url, payload, retries=4):
+_parse_sem = threading.Semaphore(3)   # Enhanced API: maks 3 permintaan bersamaan agar tidak kena 429
+
+
+def _post(url, payload, retries=6):
     body = json.dumps(payload).encode()
+    last = None
     for i in range(retries):
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "User-Agent": "crypto-whales/1.0"})
         try:
             with urllib.request.urlopen(req, timeout=45) as r:
                 return json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
+            last = e.code
             if e.code == 429 or e.code >= 500:
-                time.sleep(2 * (i + 1))
+                time.sleep(2 * (i + 1) + random.random())
                 continue
             print(f"  HTTP {e.code} dari {url.split('?')[0]}: {e.read()[:100]!r}", file=sys.stderr)
             return None
         except Exception as e:
-            print(f"  jaringan: {type(e).__name__}", file=sys.stderr)
-            time.sleep(2 * (i + 1))
+            last = type(e).__name__
+            time.sleep(2 * (i + 1) + random.random())
+    print(f"  gagal setelah {retries}x (terakhir: {last}) {url.split('?')[0]}", file=sys.stderr)
     return None
 
 
@@ -160,8 +166,9 @@ def parse_txs(sigs):
     out = []
     for i in range(0, len(sigs), 100):
         _calls["parse"] += 1
-        d = _post(f"https://api.helius.xyz/v0/transactions?api-key={helius_key()}",
-                  {"transactions": sigs[i:i + 100]})
+        with _parse_sem:
+            d = _post(f"https://api.helius.xyz/v0/transactions?api-key={helius_key()}",
+                      {"transactions": sigs[i:i + 100]})
         if not isinstance(d, list):
             print("  parse gagal untuk 1 batch (dilewati)", file=sys.stderr)
             continue
@@ -245,23 +252,41 @@ def find_buyers(mint, max_n=30, page_size=300, max_pages=3, early_window=3600):
     return early, counts, first_ts
 
 
-def window_price(mint, start_ts, span=600, limit=40):
-    """Harga pasar (SOL/token) = median harga trade pada jendela [start_ts, start_ts+span].
-    Dibaca dari transaksi koin itu sendiri (bonding curve maupun AMM), sehingga tidak
-    bergantung pada candle jam GeckoTerminal. Jendela dilebarkan 6x bila kosong.
-    Return (harga, jumlah_sampel) atau (None, 0). Trade < 0,005 SOL diabaikan (dust)."""
+def _signatures(mint, order, limit, block_time_filter):
+    res = rpc("getTransactionsForAddress",
+              [mint, {"transactionDetails": "signatures", "sortOrder": order, "limit": limit,
+                      "filters": {"blockTime": block_time_filter}}], quiet=False)
+    data = res.get("data") if isinstance(res, dict) else None
+    return [x_["signature"] for x_ in (data or []) if not x_.get("err")]
+
+
+def _median_price(txs, mint, min_sol=0.005):
+    prices = sorted(p["price"] for t in txs for p in trade_pairs(t, mint) if p["sol"] >= min_sol)
+    return (prices[len(prices) // 2], len(prices)) if prices else (None, 0)
+
+
+def window_price(mint, start_ts, span=600, limit=40, carry=True):
+    """Harga pasar (SOL/token) di sekitar start_ts, dibaca dari transaksi koin itu sendiri
+    (bonding curve maupun AMM), tanpa candle GeckoTerminal.
+      1. median harga trade >= 0,005 SOL pada [start_ts, start_ts+span], lalu jendela 6x lebih lebar;
+      2. bila tetap kosong dan carry=True: harga trade TERAKHIR sebelum start_ts (last-traded price).
+         Ini penting: koin yang mati (tak ada trade lagi) tetap dinilai dengan harga terakhirnya,
+         bukan dibuang. Membuang koin mati = survivorship bias.
+    Return (harga, jumlah_sampel, jenis) dengan jenis 'window' | 'carry' | None."""
     for sp in (span, 6 * span):
-        res = rpc("getTransactionsForAddress",
-                  [mint, {"transactionDetails": "signatures", "sortOrder": "asc", "limit": limit,
-                          "filters": {"blockTime": {"gte": int(start_ts), "lte": int(start_ts) + sp}}}], quiet=False)
-        data = [x for x in (res.get("data") or []) if not x.get("err")] if isinstance(res, dict) else []
-        if not data:
-            continue
-        prices = sorted(p["price"] for t in parse_txs([x["signature"] for x in data])
-                        for p in trade_pairs(t, mint) if p["sol"] >= 0.005)
-        if prices:
-            return prices[len(prices) // 2], len(prices)
-    return None, 0
+        sigs = _signatures(mint, "asc", limit, {"gte": int(start_ts), "lte": int(start_ts) + sp})
+        if sigs:
+            price, n = _median_price(parse_txs(sigs), mint)
+            if price is not None:
+                return price, n, "window"
+    if carry:
+        sigs = _signatures(mint, "desc", limit, {"lte": int(start_ts)})
+        if sigs:
+            for t in sorted(parse_txs(sigs), key=lambda t: -t.get("timestamp", 0)):
+                price, n = _median_price([t], mint)
+                if price is not None:
+                    return price, n, "carry"
+    return None, 0, None
 
 
 # -- Database ---------------------------------------------------------------
@@ -272,6 +297,7 @@ def init_db(path):
         CREATE TABLE IF NOT EXISTS coins(mint TEXT PRIMARY KEY, symbol TEXT, first_seen_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS appearances(wallet TEXT NOT NULL, coin_mint TEXT NOT NULL, first_seen_at TEXT NOT NULL, native_sol_volume REAL, PRIMARY KEY(wallet, coin_mint));
         CREATE TABLE IF NOT EXISTS appearance_counts(wallet TEXT NOT NULL, coin_mint TEXT NOT NULL, n_buys INTEGER NOT NULL, PRIMARY KEY(wallet, coin_mint));
+        CREATE TABLE IF NOT EXISTS coins_checked(mint TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS appearance_entry(wallet TEXT NOT NULL, coin_mint TEXT NOT NULL, entry_ts INTEGER NOT NULL, entry_price_sol REAL, bundle_size INTEGER NOT NULL, secs_after_creation INTEGER, PRIMARY KEY(wallet, coin_mint));
     """)
     return db
@@ -341,6 +367,7 @@ def main():
     p.add_argument("--max-buyers", type=int, default=30)
     p.add_argument("--scan-sigs", type=int, default=300, help="transaksi tertua per halaman (maks 1000)")
     p.add_argument("--max-pages", type=int, default=3, help="maks halaman per token")
+    p.add_argument("--workers", type=int, default=4, help="jumlah token yang diproses paralel")
     p.add_argument("--early-window", type=int, default=3600, help="detik sejak tx pertama token yang masih dianggap early")
     p.add_argument("--out", default="stage1_onchain.db")
     a = p.parse_args()
@@ -364,19 +391,32 @@ def main():
             return 1
         print(f"✅ {len(tokens)} token ditemukan")
 
-    print(f"\n🔍 Melacak early buyers untuk {len(tokens)} token...\n")
-    for i, token in enumerate(tokens):
-        print(f"[{i + 1}/{len(tokens)}] {token['mint'][:16]}...", end=" ", flush=True)
-        buyers, counts, first_ts = find_buyers(token["mint"], a.max_buyers, min(a.scan_sigs, 1000), a.max_pages, a.early_window)
-        if first_ts:
-            token["created_at"], token["created_epoch"] = iso(first_ts), first_ts
-        elif buyers:
-            token["created_at"] = buyers[0]["first_seen"]
-        if not buyers:
-            print("→ 0 buyers (dilewati)")
-            continue
-        print(f"→ {len(buyers)} buyers")
-        save(db, token, buyers, counts)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    checked = {r[0] for r in db.execute("SELECT mint FROM coins_checked")}
+    todo = [t for t in tokens if t["mint"] not in checked]
+    print(f"\n🔍 Melacak early buyers untuk {len(todo)} token ({len(tokens) - len(todo)} sudah diproses, dilewati), {a.workers} worker...\n")
+
+    def work(token):
+        return find_buyers(token["mint"], a.max_buyers, min(a.scan_sigs, 1000), a.max_pages, a.early_window)
+
+    with ThreadPoolExecutor(max_workers=max(1, a.workers)) as ex:
+        futs = {ex.submit(work, t): t for t in todo}
+        for n, fu in enumerate(as_completed(futs), 1):
+            token = futs[fu]
+            try:
+                buyers, counts, first_ts = fu.result()
+            except Exception as e:
+                print(f"[{n}/{len(todo)}] {token['mint'][:12]}.. GAGAL: {type(e).__name__}", file=sys.stderr)
+                continue
+            if first_ts:
+                token["created_at"], token["created_epoch"] = iso(first_ts), first_ts
+            elif buyers:
+                token["created_at"] = buyers[0]["first_seen"]
+            if buyers:
+                save(db, token, buyers, counts)
+            db.execute("INSERT OR IGNORE INTO coins_checked VALUES(?)", (token["mint"],))
+            db.commit()
+            print(f"[{n}/{len(todo)}] {token['mint'][:12]}.. → {len(buyers)} buyers" + ("" if buyers else " (dilewati)"), flush=True)
     recompute_wallets(db)
     summary(db, a.out)
     db.close()
