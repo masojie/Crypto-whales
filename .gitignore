@@ -2,3 +2,11 @@ node_modules/
 dist/
 .env
 .env.local
+
+# data lokal (besar, jangan pernah di-commit)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+__pycache__/
+*.pyc
