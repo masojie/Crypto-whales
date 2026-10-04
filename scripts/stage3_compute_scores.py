@@ -20,7 +20,7 @@ angka di sini WAJIB diubah mengikuti, atau kedua sistem akan diam-diam
 menghitung skor yang berbeda untuk data yang sama.
 
 Cara verifikasi bahwa Python ini konsisten dengan TypeScript:
-    lihat tests/stage3_cross_check.py — men-derive skenario yang IDENTIK,
+    lihat tests/stage3_cross_check.py (jalankan: python3 tests/stage3_cross_check.py) — men-derive skenario yang IDENTIK,
     dengan lib/scoring.test.ts (kasus 1, 2, 4, 8), lalu membuktikan angka
     yang dihasilkan stage3 ini SAMA PERSIS dengan angka yang sudah
     diverifikasi manual di scoring.test.ts.
@@ -63,6 +63,7 @@ def main() -> int:
     parser.add_argument("--stage1-db", required=True)
     parser.add_argument("--stage2-db", required=True)
     parser.add_argument("--out", default="crypto_whales_stage3.db")
+    parser.add_argument("--top", type=int, default=15, help="tampilkan N wallet teratas di ringkasan")
     args = parser.parse_args()
 
     print(f"Membuka {args.stage1_db} dan {args.stage2_db} (keduanya read-only) ...")
@@ -96,7 +97,7 @@ def main() -> int:
     print("Memuat price_points dari stage2 ...")
     price_lookup: dict[tuple[str, str, str], float | None] = {}
     for wallet, coin_mint, horizon, price_usd in stage2.execute(
-        "select wallet, coin_mint, horizon, price_usd from price_points"
+        "select wallet, coin_mint, horizon, price_usd from price_points where horizon in ('entry','h4')"
     ):
         price_lookup[(wallet, coin_mint, horizon)] = price_usd
     print(f"  {len(price_lookup)} titik harga dimuat.")
@@ -172,6 +173,15 @@ def main() -> int:
         print(f"PERHATIAN: {bot_and_qualified} wallet lolos MIN_SAMPLE TAPI juga ditandai is_bot_suspect dari stage1.")
         print("  Ini bukan error — artinya wallet itu sering muncul di banyak koin BERBEDA (bukan 1-2 koin saja,")
         print("  karena is_bot_suspect butuh <=3 koin unik). Cek manual sebelum dipercaya sebagai alpha wallet.")
+
+    all_returns = [r for rets in returns_by_wallet.values() for r in rets]
+    if all_returns:
+        base_hits = sum(1 for r in all_returns if r >= HIT_THRESHOLD_PCT - FLOAT_EPSILON)
+        print(f"\nBase rate: {base_hits}/{len(all_returns)} pasangan (wallet,koin) naik >= {HIT_THRESHOLD_PCT}% dalam 4 jam = {100 * base_hits / len(all_returns):.1f}%")
+    qualified = sorted((r for r in rows if r[4] == 1), key=lambda r: (-r[2], -r[1]))
+    print(f"\nTop {min(args.top, len(qualified))} wallet (hit rate +4j, minimal {MIN_SAMPLE} koin ternilai):")
+    for r in qualified[: args.top]:
+        print(f"  {r[0]}  koin={r[1]:3d}  hit={r[2]:5.1f}%  rata2={r[3]:+8.1f}%  bot_suspect={'ya' if r[5] else 'tidak'}")
 
     print(f"\nSelesai. Ditulis ke {args.out}")
     print("\nCATATAN: skor ini HANYA sebaik data stage2. Kalau stage2 belum")
