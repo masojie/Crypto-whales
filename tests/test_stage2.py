@@ -27,7 +27,7 @@ H = 3600
 BASE = 1_780_000_000 - (1_780_000_000 % H)
 WSOL = "So11111111111111111111111111111111111111112"
 MEME = "SomeMemeCoin1111111111111111111111111111111111"
-WORLD, POOLS, FAIL, CALLS, FAILS = {}, {}, {}, [], []
+WORLD, POOLS, FAIL, CALLS, FAILS, HIST_LIMIT = {}, {}, {}, [], [], {}
 
 
 def P(t):
@@ -110,6 +110,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if addr not in POOLS:
                 return self._send(404, {"errors": [{"status": "404"}]})
             before, limit = int(q["before_timestamp"][0]), int(q["limit"][0])
+            if addr in HIST_LIMIT and before <= HIST_LIMIT[addr]:
+                return self._send(401, {"errors": ["You can only access data from the past 180 days with Public API."]})
             rows = sorted(((ts, cd[0], cd[1], cd[2]) for ts, cd in POOLS[addr].items() if ts < before), reverse=True)[:limit]
             return self._send(200, {"data": {"attributes": {"ohlcv_list": [[ts, o, max(o, c), min(o, c), c, v] for ts, o, c, v in rows]}}})
         self._send(404, {"errors": ["rute tak dikenal"]})
@@ -174,6 +176,10 @@ def main():
     add_pool("MintH", "PH", 1e6, 0, candles(0, 100, 100))
     FAIL[("pools", "MintF")] = [500]
     FAIL[("ohlcv", "PF")] = [429, 500]
+    add_pool("MintI", "PI", 1e6, 0, candles(0, 200, 100))
+    HIST_LIMIT["PI"] = BASE + 100 * H
+    add_pool("MintJ", "PJ", 1e6, 0, candles(0, 50, 100))
+    FAIL[("pools", "MintJ")] = [401] * 10
     srv = socketserver.TCPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     s2.API_BASE = f"http://127.0.0.1:{srv.server_address[1]}/api/v2"
@@ -181,7 +187,8 @@ def main():
     entries = [("wA1", "MintA", 10.5), ("wA2", "MintA", 120.25), ("wA3", "MintA", 300.75),
                ("wB1", "MintB", 20.5), ("wB2", "MintB", 90.5), ("wB3", "MintB", 105.5), ("wB4", "MintB", 150.25),
                ("wC0", "MintC", -5.0), ("wC1", "MintC", 55.5), ("wC2", "MintC", 210.0), ("wC3", "MintC", 400.0),
-               ("wD1", "MintD", 10.0), ("wE1", "MintE", 10.0), ("wF1", "MintF", 10.5), ("wH1", "MintH", 10.5)]
+               ("wD1", "MintD", 10.0), ("wE1", "MintE", 10.0), ("wF1", "MintF", 10.5), ("wH1", "MintH", 10.5),
+               ("wI1", "MintI", 150.5), ("wI2", "MintI", 50.5), ("wI3", "MintI", 80.5), ("wJ1", "MintJ", 10.5)]
     s1p = os.path.join(tmp, "s1.db")
     make_stage1(s1p, entries)
     stage1 = sqlite3.connect(s1p)
@@ -243,6 +250,22 @@ def main():
     run("MintH", now=at(30))
     check_price(out, "wH1", "MintH", "h4", P(at(14.5)), "MintH (masih masa lalu)")
     check_price(out, "wH1", "MintH", "h24", None, "MintH (34.5j > sekarang tiruan 30j)")
+
+    print("== MintI: 401 pada halaman tua = riwayat terpotong (batas 180 hari), bukan error")
+    n0 = len(CALLS)
+    st, _ = run("MintI")
+    check(st == "ok_partial", f"MintI status ok_partial (dapat {st})")
+    check(sum(1 for c in CALLS[n0:] if "/pools/PI/ohlcv/" in c) == 3, "tepat 3 panggilan candle, 401 TIDAK di-retry")
+    for label, k in (("entry", 0), ("h1", 1), ("h4", 4), ("h24", 24)):
+        check_price(out, "wI1", "MintI", label, P(at(150.5 + k)), "wI1 (di dalam batas)")
+        check_price(out, "wI3", "MintI", label, P(at(80.5 + k)), "wI3 (candle tersisa tetap dipakai)")
+        check_price(out, "wI2", "MintI", label, None, "wI2 (sebelum batas) = NULL")
+
+    print("== MintJ: 401 pada daftar pool = error akses global, tidak dicatat selesai")
+    n0 = len(CALLS)
+    st, _ = run("MintJ")
+    check(st == "error" and sum(1 for c in CALLS[n0:] if "/tokens/MintJ/pools" in c) == 1, f"MintJ error tanpa retry (dapat {st})")
+    check(out.execute("select count(*) from coin_stats where coin_mint='MintJ'").fetchone()[0] == 0, "MintJ tidak dicatat selesai")
 
     print("== statistik per koin")
     row = out.execute("select status, n_wallets, entry_ok, h4_ok from coin_stats where coin_mint='MintA'").fetchone()
