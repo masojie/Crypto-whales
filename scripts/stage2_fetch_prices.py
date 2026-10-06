@@ -18,6 +18,8 @@ Keamanan: jeda --interval antar panggilan, 429 menggandakan jeda (maks 120s) dan
 Retry-After dipatuhi. 404 (token tak ada) dibedakan dari error sementara; error sementara
 TIDAK dicatat selesai (dicoba lagi di run berikut). Satu koin = satu transaksi database.
 Berhenti sendiri setelah 8 koin gagal berturut-turut. Aman di-Ctrl+C dan dilanjut.
+401/403 pada halaman candle = riwayat melewati batas 180 hari tier gratis: candle yang sudah didapat
+dipakai, koin ditandai ok_partial, wallet yang masuk sebelum batas dapat harga NULL (tidak dinilai).
 
 Pakai: python3 scripts/stage2_fetch_prices.py --stage1-db crypto_whales_stage1.db --max-coins 50
 """
@@ -110,7 +112,7 @@ def _retry_after(err):
 
 
 def api_get(throttle, path, max_attempts=6):
-    """-> (status, json). status: 'ok' | 'not_found' | 'error' (error = sementara, BUKAN 'tidak ada')."""
+    """-> (status, json). status: 'ok' | 'not_found' | 'forbidden' (401/403, mis. riwayat > 180 hari di tier gratis) | 'error' (sementara, BUKAN 'tidak ada')."""
     url = f"{API_BASE}{path}"
     for attempt in range(max_attempts):
         throttle.wait()
@@ -123,6 +125,8 @@ def api_get(throttle, path, max_attempts=6):
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return "not_found", None
+            if e.code in (401, 403):
+                return "forbidden", None
             if e.code == 429:
                 throttle.penalize()
                 wait = max(_retry_after(e) or 0.0, throttle.interval)
@@ -141,7 +145,7 @@ def list_pools(throttle, mint):
     """-> (status, [(reserve_usd, created_ts|None, address)]) untuk pool yang layak."""
     status, body = api_get(throttle, f"/networks/{NETWORK}/tokens/{mint}/pools?page=1")
     if status != "ok":
-        return status, []
+        return ("error" if status == "forbidden" else status), []
     eligible = []
     for p in body.get("data") or []:
         try:
@@ -195,8 +199,10 @@ def parse_ohlcv(body):
 
 
 def fetch_candles(throttle, pool, t_lo, t_hi):
-    """Candle per jam yang menutup [t_lo, t_hi]. -> (status, {ts: (open, close, volume)})."""
+    """Candle per jam yang menutup [t_lo, t_hi]. -> (status, {ts: (open, close, volume)}, terpotong).
+    terpotong=True kalau API menolak (401/403) halaman yang lebih tua: batas 180 hari tier gratis."""
     candles = {}
+    cut = False
     before = int(t_hi)
     for _ in range(MAX_PAGES_PER_POOL):
         status, body = api_get(
@@ -205,7 +211,10 @@ def fetch_candles(throttle, pool, t_lo, t_hi):
             f"?aggregate=1&limit={CANDLE_LIMIT}&before_timestamp={before}&currency=usd",
         )
         if status == "error":
-            return "error", candles
+            return "error", candles, cut
+        if status == "forbidden":
+            cut = True
+            break
         if status == "not_found":
             break
         rows = parse_ohlcv(body)
@@ -217,7 +226,7 @@ def fetch_candles(throttle, pool, t_lo, t_hi):
         if oldest <= t_lo or len(rows) < CANDLE_LIMIT:
             break
         before = oldest
-    return "ok", candles
+    return "ok", candles, cut
 
 
 def merge_candles(series_list):
@@ -335,14 +344,16 @@ def process_coin(out, stage1, throttle, mint, now_ts):
     t_lo = t_min - STALE_SECONDS - HOUR
     t_hi = t_max + 25 * HOUR
     all_series = []
+    any_cut = False
     for pool in pools:
-        st, candles = fetch_candles(throttle, pool, t_lo, t_hi)
+        st, candles, cut = fetch_candles(throttle, pool, t_lo, t_hi)
         if st == "error":
             return "error", {}
+        any_cut = any_cut or cut
         all_series.append(candles)
     merged = merge_candles(all_series)
     if not merged:
-        return finish("no_candles", ",".join(pools))
+        return finish("no_history" if any_cut else "no_candles", ",".join(pools))
 
     series = Series(merged)
     rows = []
@@ -354,7 +365,7 @@ def process_coin(out, stage1, throttle, mint, now_ts):
             if p is not None:
                 counts[k] += 1
             rows.append((wallet, mint, label, p, done_at))
-    return finish("ok", ",".join(pools), len(merged), rows, tuple(counts))
+    return finish("ok_partial" if any_cut else "ok", ",".join(pools), len(merged), rows, tuple(counts))
 
 
 def main(argv=None):
@@ -408,11 +419,12 @@ def main(argv=None):
             consecutive_errors = 0
             processed += 1
             eta_h = (time.monotonic() - started) / i * (len(remaining) - i) / 3600
-            if status == "ok":
+            if status in ("ok", "ok_partial"):
                 ok = info["ok"]
                 pct = lambda k: 100.0 * ok[k] / max(info["n_wallets"], 1)
                 log(f"[{i}/{len(remaining)}] {mint[:10]}... w={info['n_wallets']} candle={info['n_candles']} panggilan={info['calls']} "
-                    f"entry={pct(0):.0f}% h4={pct(2):.0f}% (sisa ~{eta_h:.1f} jam, jeda {throttle.interval:.1f}s)")
+                    f"entry={pct(0):.0f}% h4={pct(2):.0f}% (sisa ~{eta_h:.1f} jam, jeda {throttle.interval:.1f}s)"
+                    + (" [RIWAYAT TERPOTONG 180 HARI]" if status == "ok_partial" else ""))
             else:
                 log(f"[{i}/{len(remaining)}] {mint[:10]}... w={info['n_wallets']} status={status} (tanpa harga)")
     except KeyboardInterrupt:
